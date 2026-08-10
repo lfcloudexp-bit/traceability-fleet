@@ -7,3 +7,4 @@ google-cloud-pubsub
 opentelemetry-sdk
 opentelemetry-exporter-gcp-trace
 openpyxl
+python-multipart

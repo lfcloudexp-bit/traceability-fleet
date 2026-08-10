@@ -250,7 +250,11 @@ async def consume(request: Request):
     run_id, project = data["run_id"], data["project"]
     with telemetry.span(f"agent.{AGENT_ID}", project=project, run=run_id):
         try:
-            result = HANDLERS[AGENT_ID](run_id, project, data.get("text", ""))
+            if AGENT_ID == "ingestor" and data.get("requirements"):
+                result = run_ingestor_structured(run_id, project,
+                                                 data["requirements"])
+            else:
+                result = HANDLERS[AGENT_ID](run_id, project, data.get("text", ""))
             telemetry.finish_run(run_id, "completed", result)
             return {"ok": True, "agent": AGENT_ID, **result}
         except Exception as exc:
@@ -258,3 +262,45 @@ async def consume(request: Request):
             telemetry.record_step(run_id, AGENT_ID, "error", detail, {}, {}, "ERROR")
             telemetry.finish_run(run_id, "failed", {"error": detail})
             raise HTTPException(500, detail)
+
+
+def run_ingestor_structured(run_id, project, incoming):
+    """Requirements that arrived already atomic, from a spreadsheet or ReqIF.
+
+    Nothing is decomposed and nothing is renumbered. Renaming a customer
+    identifier destroys upward traceability, which is the whole point. The only
+    judgement left is whether each requirement states a criterion a test could
+    actually verify.
+    """
+    verdicts = _gemini_json(
+        "You are a requirements engineer reviewing a customer specification. "
+        "For each requirement decide whether it is objectively verifiable, "
+        "meaning it states a measurable criterion a test could check. Return "
+        "exactly one entry per input requirement, echoing the id unchanged. "
+        'Schema: [{"id":"<id exactly as given>","verifiable":true|false,'
+        '"reason":"one sentence"}]. '
+        + JSON_RULE + "\n\nREQUIREMENTS:\n"
+        + json.dumps([{"id": r["id"], "text": r["text"]} for r in incoming]))
+    by_id = {v.get("id"): v for v in verdicts}
+
+    weak = []
+    for r in incoming:
+        v = by_id.get(r["id"], {})
+        doc = dict(r)
+        doc["verifiable"] = v.get("verifiable")
+        doc["reason"] = v.get("reason", "")
+        memory.write(AGENT_ID, "requirements", f"{project}-{r['id']}", doc, project)
+        if v.get("verifiable") is False:
+            weak.append(r["id"])
+
+    preserved = sum(1 for r in incoming if r.get("id_origin") == "preserved")
+    telemetry.record_step(
+        run_id, AGENT_ID, "assess",
+        f"Reviewed {len(incoming)} pre-structured requirements without "
+        f"decomposing or renumbering them; {preserved} carry the customer's own "
+        f"identifier; {len(weak)} state no measurable criterion",
+        {"incoming": len(incoming)}, {"unverifiable": weak})
+    memory.append_event(project, AGENT_ID, "requirements_assessed",
+                        {"n": len(incoming), "unverifiable": len(weak)})
+    return {"requirements": len(incoming), "unverifiable": weak,
+            "preserved_ids": preserved}

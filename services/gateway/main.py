@@ -5,10 +5,10 @@ Model Armor, authorised against the Registry, traced, and only then dispatched
 onto the asynchronous runtime. Agents hold no public endpoint of their own.
 """
 import os, json
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from google.cloud import pubsub_v1
-from common import registry, memory, telemetry, armor
+from common import registry, memory, telemetry, armor, excel_adapter
 
 PROJECT = os.environ["GCP_PROJECT"]
 TOPIC = os.environ.get("TASK_TOPIC", "agent-tasks")
@@ -116,3 +116,78 @@ def reasoning_chain(run_id: str):
 def project_state(project: str, agent: str = "auditor"):
     """Compact state an agent resumes from after weeks away."""
     return memory.rehydrate(agent, project)
+
+
+@app.post("/submit/excel")
+async def submit_excel(project: str = Form(...), file: UploadFile = File(...)):
+    """Ingest a customer requirements spreadsheet.
+
+    The rows arrive already atomic, so the fleet must not re-decompose them,
+    and above all must not renumber them. A spreadsheet is no less untrusted
+    than a prose document, so Model Armor still screens every cell of text.
+    """
+    data = await file.read()
+    agent_id, tool = TASK_ROUTING["extract_requirements"]
+
+    with telemetry.span("gateway.submit_excel", project=project, agent=agent_id):
+        run_id = telemetry.new_run(project, "ingest_excel")
+        try:
+            parsed = excel_adapter.parse(data)
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {exc}"[:200]
+            telemetry.record_step(run_id, "gateway", "parse", detail,
+                                  {"filename": file.filename}, {}, "ERROR")
+            telemetry.finish_run(run_id, "failed", {"error": detail})
+            raise HTTPException(422, {"error": detail, "run_id": run_id})
+
+        reqs = parsed["requirements"]
+        telemetry.record_step(
+            run_id, "gateway", "parse",
+            f"Header on row {parsed['header_row']}; columns mapped as "
+            f"{parsed['column_mapping']}; {parsed['preserved_ids']} customer "
+            f"identifiers preserved and {parsed['derived_ids']} derived",
+            {"filename": file.filename, "sheet": parsed["sheet"]},
+            {"requirements": len(reqs)})
+
+        v = armor.screen("\n".join(r["text"] for r in reqs),
+                         source=file.filename or "upload.xlsx", agent="gateway")
+        telemetry.record_step(
+            run_id, "gateway", "screen",
+            f"{len(v['injection_findings'])} injection finding(s); "
+            f"judge={v['judge']['verdict']}: {v['judge']['reason']}",
+            {"chars": v["chars"], "sha256_16": v["doc_sha256_16"]},
+            {"pii_redacted": len(v["pii_findings"])}, v["decision"])
+        if v["decision"] == "BLOCK":
+            telemetry.finish_run(run_id, "blocked", {"reason": "model_armor"})
+            raise HTTPException(422, {"error": "blocked by Model Armor",
+                                      "run_id": run_id, "audit_id": v["audit_id"],
+                                      "findings": v["injection_findings"]})
+
+        try:
+            manifest = registry.authorize(agent_id, tool)
+        except registry.PolicyViolation as exc:
+            telemetry.record_step(run_id, "gateway", "authorize", str(exc),
+                                  {"agent": agent_id}, {}, "DENY")
+            telemetry.finish_run(run_id, "denied", {"reason": str(exc)})
+            raise HTTPException(403, {"error": str(exc), "run_id": run_id})
+        telemetry.record_step(run_id, "gateway", "authorize",
+                              f"{agent_id} v{manifest['version']} is approved and holds {tool}",
+                              {"agent": agent_id, "tool": tool}, {}, "ALLOW")
+
+        body = json.dumps({"run_id": run_id, "project": project,
+                           "task": "extract_requirements", "agent": agent_id,
+                           "requirements": reqs,
+                           "trace_id": telemetry.current_trace_id()}).encode()
+        msg_id = _publisher.publish(_topic_path, body, agent=agent_id,
+                                    task="extract_requirements").result(timeout=30)
+        telemetry.record_step(run_id, "gateway", "dispatch",
+                              f"queued {len(reqs)} pre-structured requirements for {agent_id}",
+                              {"message_id": msg_id}, {}, "QUEUED")
+        memory.append_event(project, "gateway", "excel_ingested",
+                            {"file": file.filename, "requirements": len(reqs),
+                             "preserved": parsed["preserved_ids"]})
+
+    return {"run_id": run_id, "status": "queued", "armor": v["decision"],
+            "requirements": len(reqs), "preserved_ids": parsed["preserved_ids"],
+            "derived_ids": parsed["derived_ids"],
+            "column_mapping": parsed["column_mapping"]}
