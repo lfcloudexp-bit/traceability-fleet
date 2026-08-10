@@ -8,7 +8,7 @@ agent's scopes.
 import os, json, base64
 from fastapi import FastAPI, Request, HTTPException
 from google import genai
-from common import registry, memory, telemetry
+from common import registry, memory, telemetry, llm
 
 PROJECT = os.environ["GCP_PROJECT"]
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
@@ -23,7 +23,7 @@ JSON_RULE = ("Answer ONLY with valid JSON, no prose and no code fences. "
 
 def _gemini_json(prompt):
     registry.authorize(AGENT_ID, "gemini.generate")
-    raw = _client.models.generate_content(model=MODEL, contents=prompt).text
+    raw = llm.generate(prompt)
     cleaned = raw.strip()
     for fence in ("```json", "```"):
         if cleaned.startswith(fence):

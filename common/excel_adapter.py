@@ -13,6 +13,7 @@ carries less weight in an audit than one that quotes the customer's number.
 import io, os, json, re
 from openpyxl import load_workbook
 from google import genai
+from common import llm
 
 PROJECT = os.environ["GCP_PROJECT"]
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
@@ -80,7 +81,7 @@ def map_columns(headers, samples):
         '"rationale":null,"parent":null}. Always answer in English.\n\n'
         f"HEADERS: {json.dumps(headers)}\n\nSAMPLE ROWS:\n"
         + json.dumps(samples[:4]))
-    raw = _client.models.generate_content(model=MODEL, contents=prompt).text.strip()
+    raw = llm.generate(prompt).strip()
     for fence in ("```json", "```"):
         if raw.startswith(fence):
             raw = raw[len(fence):]

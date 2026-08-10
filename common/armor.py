@@ -8,6 +8,7 @@ immutable audit trail.
 import os, re, datetime, hashlib
 from google import genai
 from google.cloud import firestore
+from common import llm
 
 PROJECT = os.environ["GCP_PROJECT"]
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
@@ -55,8 +56,7 @@ def _regex_scan(text):
 
 def _llm_scan(text):
     try:
-        out = _client.models.generate_content(
-            model=MODEL, contents=LLM_JUDGE + text[:6000]).text.strip()
+        out = llm.generate(LLM_JUDGE + text[:6000]).strip()
     except Exception as exc:
         return {"verdict": "UNKNOWN", "reason": f"judge unavailable: {type(exc).__name__}"}
     verdict = "UNKNOWN"

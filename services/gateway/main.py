@@ -8,7 +8,8 @@ import os, json
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from google.cloud import pubsub_v1
-from common import registry, memory, telemetry, armor, excel_adapter
+from fastapi.responses import JSONResponse
+from common import registry, memory, telemetry, armor, excel_adapter, llm
 
 PROJECT = os.environ["GCP_PROJECT"]
 TOPIC = os.environ.get("TASK_TOPIC", "agent-tasks")
@@ -16,6 +17,14 @@ _publisher = pubsub_v1.PublisherClient()
 _topic_path = _publisher.topic_path(PROJECT, TOPIC)
 
 app = FastAPI(title="Traceability Fleet - Agent Gateway", version="1.0.0")
+
+
+@app.exception_handler(llm.ModelUnavailable)
+async def _model_unavailable(request, exc):
+    """Throttling is not a bug. Say so, and say when to come back."""
+    return JSONResponse(status_code=503, headers={"Retry-After": "60"},
+                        content={"error": "model temporarily unavailable",
+                                 "detail": str(exc)[:200]})
 
 # A task is bound to exactly one agent and one tool. The mapping is explicit
 # so a caller cannot ask for an agent-tool pair that was never designed.
