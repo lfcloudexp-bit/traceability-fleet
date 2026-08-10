@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+pydantic
+google-genai
+google-cloud-firestore
+google-cloud-pubsub
+opentelemetry-sdk
+opentelemetry-exporter-gcp-trace

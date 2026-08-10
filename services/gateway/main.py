@@ -1,44 +1,118 @@
-import os, json, uuid, datetime
-from fastapi import FastAPI
+"""Agent Gateway - single entry point and policy enforcement point.
+
+Nothing reaches an agent except through here. Every request is screened by
+Model Armor, authorised against the Registry, traced, and only then dispatched
+onto the asynchronous runtime. Agents hold no public endpoint of their own.
+"""
+import os, json
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from google import genai
-from google.cloud import firestore
+from google.cloud import pubsub_v1
+from common import registry, memory, telemetry, armor
 
 PROJECT = os.environ["GCP_PROJECT"]
-MODEL   = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+TOPIC = os.environ.get("TASK_TOPIC", "agent-tasks")
+_publisher = pubsub_v1.PublisherClient()
+_topic_path = _publisher.topic_path(PROJECT, TOPIC)
 
-app = FastAPI(title="Traceability Fleet - Gateway")
-gclient = genai.Client(vertexai=True, project=PROJECT, location="global")
-db = firestore.Client(project=PROJECT)
+app = FastAPI(title="Traceability Fleet - Agent Gateway", version="1.0.0")
 
-class Spec(BaseModel):
-    text: str
-    source: str = "manual"
+# A task is bound to exactly one agent and one tool. The mapping is explicit
+# so a caller cannot ask for an agent-tool pair that was never designed.
+TASK_ROUTING = {
+    "extract_requirements": ("ingestor", "firestore.write:requirements"),
+    "link_traces": ("linker", "firestore.write:trace_links"),
+    "audit": ("auditor", "firestore.write:findings"),
+    "assess_impact": ("impact", "firestore.write:impact_reports"),
+}
+
+
+class Submission(BaseModel):
+    project: str
+    task: str
+    text: str = ""
+    source: str = "api"
+
 
 @app.get("/")
 def health():
-    return {"status": "ok", "model": MODEL, "project": PROJECT}
+    return {"status": "ok", "service": "gateway", "project": PROJECT,
+            "otel": telemetry.OTEL_ENABLED, "tasks": sorted(TASK_ROUTING)}
 
-@app.post("/ingest")
-def ingest(spec: Spec):
-    prompt = (
-        "You are a requirements engineer. Extract ATOMIC requirements from the "
-        "specification text below. Answer ONLY with a JSON array. Each element: "
-        '{"id": "REQ-###", "text": "...", "type": "functional|non-functional", '
-        '"verifiable": true|false}. Always answer in English.\n\n'
-        f"SPECIFICATION:\n{spec.text}"
-    )
-    raw = gclient.models.generate_content(model=MODEL, contents=prompt).text
-    cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```")
-    try:
-        reqs = json.loads(cleaned)
-    except Exception:
-        return {"error": "model did not return valid JSON", "raw": raw[:500]}
 
-    batch_id = str(uuid.uuid4())[:8]
-    for r in reqs:
-        db.collection("requirements").document(f"{batch_id}-{r.get('id','?')}").set(
-            {**r, "batch": batch_id, "source": spec.source,
-             "ingested_at": datetime.datetime.utcnow().isoformat()}
-        )
-    return {"batch": batch_id, "extracted": len(reqs), "requirements": reqs}
+@app.get("/registry")
+def discovery(department: str = None):
+    """Discovery: which agents exist, who owns them, what they may touch."""
+    return {"agents": registry.list_agents(department)}
+
+
+@app.post("/submit")
+def submit(sub: Submission):
+    """Screen, authorise, dispatch. In that order, every time."""
+    if sub.task not in TASK_ROUTING:
+        raise HTTPException(400, f"unknown task '{sub.task}'")
+    agent_id, tool = TASK_ROUTING[sub.task]
+
+    with telemetry.span("gateway.submit", task=sub.task, agent=agent_id,
+                        project=sub.project):
+        run_id = telemetry.new_run(sub.project, sub.task)
+
+        # 1. Untrusted input is screened before anything else touches it.
+        v = armor.screen(sub.text, source=sub.source, agent="gateway")
+        telemetry.record_step(
+            run_id, "gateway", "screen",
+            f"{len(v['injection_findings'])} injection finding(s); "
+            f"judge={v['judge']['verdict']}: {v['judge']['reason']}",
+            {"chars": v["chars"], "sha256_16": v["doc_sha256_16"]},
+            {"pii_redacted": len(v["pii_findings"])}, v["decision"])
+        if v["decision"] == "BLOCK":
+            telemetry.finish_run(run_id, "blocked", {"reason": "model_armor"})
+            raise HTTPException(422, {"error": "blocked by Model Armor",
+                                      "run_id": run_id,
+                                      "audit_id": v["audit_id"],
+                                      "findings": v["injection_findings"],
+                                      "judge": v["judge"]})
+
+        # 2. Zero trust: the agent must be registered and hold the tool.
+        try:
+            manifest = registry.authorize(agent_id, tool)
+        except registry.PolicyViolation as exc:
+            telemetry.record_step(run_id, "gateway", "authorize", str(exc),
+                                  {"agent": agent_id, "tool": tool}, {}, "DENY")
+            telemetry.finish_run(run_id, "denied", {"reason": str(exc)})
+            raise HTTPException(403, {"error": str(exc), "run_id": run_id})
+        telemetry.record_step(
+            run_id, "gateway", "authorize",
+            f"{agent_id} v{manifest['version']} is approved and holds {tool}",
+            {"agent": agent_id, "tool": tool}, {}, "ALLOW")
+
+        # 3. Dispatch onto the asynchronous runtime.
+        body = json.dumps({"run_id": run_id, "project": sub.project,
+                           "task": sub.task, "agent": agent_id,
+                           "text": v["text"],
+                           "trace_id": telemetry.current_trace_id()}).encode()
+        msg_id = _publisher.publish(_topic_path, body, agent=agent_id,
+                                    task=sub.task).result(timeout=30)
+        telemetry.record_step(run_id, "gateway", "dispatch",
+                              f"queued for {agent_id} on topic {TOPIC}",
+                              {"message_id": msg_id}, {}, "QUEUED")
+        memory.append_event(sub.project, "gateway", "task_dispatched",
+                            {"task": sub.task, "agent": agent_id, "run": run_id})
+
+    return {"run_id": run_id, "agent": agent_id, "status": "queued",
+            "armor": v["decision"], "message_id": msg_id}
+
+
+@app.get("/runs/{run_id}")
+def reasoning_chain(run_id: str):
+    """End-to-end reasoning chain. Why the fleet decided what it decided."""
+    steps = telemetry.chain(run_id)
+    if not steps:
+        raise HTTPException(404, f"no run '{run_id}'")
+    return {"run_id": run_id, "steps": steps}
+
+
+@app.get("/state/{project}")
+def project_state(project: str, agent: str = "auditor"):
+    """Compact state an agent resumes from after weeks away."""
+    return memory.rehydrate(agent, project)
